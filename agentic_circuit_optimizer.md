@@ -135,19 +135,56 @@ pc <<= next_pc                                   # 写周期 2,环深 2 —— �
 
 #### 2.4.3 更进一步:把切分点数据化
 
-PyCircuit 是 Python 元编程,切分点可以不写死在代码里,而是变成配置:
+PyCircuit 是 Python 元编程,切分点可以不写死在代码里,而是变成配置。约定的形式是:**每个候选切割点对应一个布尔常量符号**(`cut_after_decode`、`cut_after_rename`、…),作为模块的编译期特化参数;在编译开始之前设定这些常量的取值,决定哪些切割点实际生效。一个可运行的完整示例(信号须经 `cas()` 包装为周期感知信号,`domain.next()` 才对其生效):
 
 ```python
-def datapath(m, domain, *, cut_after: set[str], prefix="dp"):
-    ...  # decode 逻辑
-    if "decode" in cut_after:
+from pycircuit import cas, compile_cycle_aware, wire_of
+
+def datapath(m, domain, *,
+             cut_after_decode=False,
+             cut_after_rename=False,
+             cut_after_issue=False):
+    a = cas(domain, m.input("a", width=8))
+
+    # ---- 第一段:decode 逻辑 ----
+    decoded = a + 1
+    if cut_after_decode:           # 常量为真则在 decode 段之后切一刀
         domain.next()
-    ...  # rename 逻辑
-    if "rename" in cut_after:
+
+    # ---- 第二段:rename 逻辑 ----
+    renamed = decoded + 2
+    if cut_after_rename:           # 常量为真则在 rename 段之后切一刀
         domain.next()
+
+    # ---- 第三段:issue 逻辑 ----
+    issued = renamed + 3
+    if cut_after_issue:            # 常量为真则在 issue 段之后切一刀
+        domain.next()
+
+    # ---- 第四段:execute 逻辑 ----
+    result = issued + 4
+    m.output("y", wire_of(result))
 ```
 
-智能体的变异动作从"编辑代码"进一步收缩为"编辑一个集合",动作空间完全结构化、天然可枚举可搜索,决策记录只需记录 `cut_after` 的取值。这是"代码主体不变、只动切割点"的极致形态,与 §4.4 的 Pareto 前沿搜索直接衔接:每个候选切分方案是搜索空间中的一个离散点,可批量生成、批量过等价门、批量测量。
+编译前设定常量取值,每种取值组合就是一个独立的 JIT 特化:
+
+```python
+# 纯组合逻辑,0 级流水
+compile_cycle_aware(datapath)
+
+# 切 1 刀 = 2 段:decode | rename+issue+execute
+compile_cycle_aware(datapath, cut_after_decode=True)
+
+# 切 3 刀 = 4 段:每段一级
+compile_cycle_aware(datapath, cut_after_decode=True,
+                    cut_after_rename=True, cut_after_issue=True)
+```
+
+**静态性契约:改常量即重新 JIT,网表恒为静态。** 这些 `cut_after_*` 常量是编译期特化数据,不是电路里的信号:JIT 在展开(elaboration)时把每个 `if cut_after_*:` 按常量取值折叠掉,生成的网表中不存在任何与切割点相关的动态结构——没有多余的 mux,没有运行时可配置性。改变任何一个常量的取值都触发一次**重新 JIT 编译**,产出一个新的特化模块(取值向量记录在模块的 `pyc.params` 属性中,天然就是决策记录);搜索过程中每评估一个切分方案就重编译一次,这个代价完全可接受——换来的是每个候选点的网表都和手写固定切分完全相同,PPA 测量结果不被任何动态开销污染。实测:三个候选点的 \(2^3=8\) 种取值组合逐一 JIT 编译,生成 MLIR 中自动平衡插入的流水寄存器(`pyc.reg`)数量精确等于置位常量的个数(0 到 3 个),切分行为与常量取值严格一一对应。
+
+智能体的变异动作从"编辑代码"进一步收缩为"编辑一组布尔常量",动作空间完全结构化、天然可枚举可搜索,决策记录只需记录布尔向量的取值。这是"代码主体不变、只动切割点"的极致形态,与 §4.4 的 Pareto 前沿搜索直接衔接:每个候选切分方案是搜索空间中的一个离散点,可批量生成、批量过等价门、批量测量。
+
+**预设候选点决定搜索空间。** 必须明确:`if cut_after_decode:` 这个判断本身是程序员(或上游智能体)预先插入在 PyCircuit 源码里的,每一处判断是一个**预设的候选切分点**;`cut_after_decode`、`cut_after_rename` 这些常量符号是给代码段落(流水级边界候选位置)起的名字,不是任何电路信号的名字。数据化并不凭空创造切分自由度——它只是把"在哪些预设位置切"从代码结构中提取出来,暴露为编译期配置。因此搜索空间由预插入的判断点完全决定:布设了 \(n\) 个候选点,搜索空间就是 \(n\) 维布尔向量的 \(2^n\) 种取值,不多不少;没有布设候选点的位置,优化循环无论如何枚举都触及不到。这把变异动作自然分成两层:**内层动作**是改布尔常量的取值并重新 JIT,在既定搜索空间内枚举,完全结构化、构造性保等价(前馈段内);**外层动作**是编辑源码以新增、删除或移动候选切分点,即修改搜索空间本身——这回到了 §2.4.2 普通代码编辑的语义,其等价风险与收益也回到该节的分析。由此得到一种务实的分工:人或高层智能体负责布设候选切分点(定义搜索空间,低频、需要微架构判断),优化循环内的智能体只在既定空间内枚举(高频、机械、可批量);当内层搜索在整个 \(2^n\) 空间上收敛仍不满足目标时,才升级为一次外层动作,重新划定搜索空间。
 
 ### 2.5 两种并行性:空间并行是默认,时间并行才需要声明
 
